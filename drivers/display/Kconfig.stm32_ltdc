@@ -22,6 +22,12 @@ choice STM32_LTDC_PIXEL_FORMAT
 	help
 	  Specify the color pixel format for the STM32 LCD-TFT display controller.
 
+config STM32_LTDC_L8
+	bool "L8 (indexed color / palette)"
+	help
+	  One pixel consists of 8-bit index into a color lookup table (CLUT)
+	  (1 byte per pixel). Requires CLUT programming for color mapping.
+
 config STM32_LTDC_ARGB8888
 	bool "ARGB8888"
 	help
@@ -78,5 +84,33 @@ config STM32_LTDC_DISABLE_FMC_BANK1
 	help
 	  Disable FMC bank1 if not used to prevent speculative read accesses.
 	  Refer to AN4861 "4.6 Special recommendations for Cortex-M7 (STM32F7/H7)".
+
+choice STM32_LTDC_CLUT_PROFILE
+	prompt "CLUT (Color Lookup Table) profile for L8 mode"
+	depends on STM32_LTDC_L8
+	default STM32_LTDC_CLUT_GRAYSCALE
+	help
+	  Select the default CLUT configuration for indexed color mode.
+	  This sets the initial color palette; runtime updates are possible via API.
+
+config STM32_LTDC_CLUT_GRAYSCALE
+	bool "Grayscale"
+	help
+	  Linear grayscale palette (index i maps to RGB(i, i, i))
+
+config STM32_LTDC_CLUT_CUSTOM
+	bool "Custom palette (all zeros, application-provided)"
+	help
+	  Empty black palette; application must upload custom CLUT before rendering
+
+endchoice
+
+config STM32_LTDC_CLUT_UPDATE_API
+	bool "Enable CLUT runtime update API"
+	depends on STM32_LTDC_L8
+	default y
+	help
+	  Expose a function to update the color palette at runtime.
+	  Required for palette animation or dynamic theme switching.
 
 endif # STM32_LTDC

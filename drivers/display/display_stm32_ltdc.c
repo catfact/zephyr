@@ -45,7 +45,10 @@ LOG_MODULE_REGISTER(display_stm32_ltdc, CONFIG_DISPLAY_LOG_LEVEL);
 #define LTDC_PCPOL_ACTIVE_LOW     0x00000000
 #define LTDC_PCPOL_ACTIVE_HIGH    0x10000000
 
-#if CONFIG_STM32_LTDC_ARGB8888
+#if CONFIG_STM32_LTDC_L8
+#define STM32_LTDC_INIT_PIXEL_FORMAT	LTDC_PIXEL_FORMAT_L8
+#define DISPLAY_INIT_PIXEL_FORMAT	PIXEL_FORMAT_L_8
+#elif CONFIG_STM32_LTDC_ARGB8888
 #define STM32_LTDC_INIT_PIXEL_FORMAT	LTDC_PIXEL_FORMAT_ARGB8888
 #define DISPLAY_INIT_PIXEL_FORMAT	PIXEL_FORMAT_ARGB_8888
 #elif CONFIG_STM32_LTDC_RGB888
@@ -61,6 +64,10 @@ LOG_MODULE_REGISTER(display_stm32_ltdc, CONFIG_DISPLAY_LOG_LEVEL);
 #define STM32_LTDC_INIT_PIXEL_SIZE	DISPLAY_BITS_PER_PIXEL(DISPLAY_INIT_PIXEL_FORMAT) \
 					/ BITS_PER_BYTE
 
+/* CLUT entry: 8-bit alpha (MSB) + 8-bit red + 8-bit green + 8-bit blue (LSB) */
+#define STM32_LTDC_CLUT_SIZE		256
+typedef uint32_t clut_entry_t;
+
 struct display_stm32_ltdc_data {
 	LTDC_HandleTypeDef hltdc;
 	enum display_pixel_format current_pixel_format;
@@ -70,6 +77,9 @@ struct display_stm32_ltdc_data {
 	const uint8_t *pend_buf;
 	const uint8_t *front_buf;
 	struct k_sem sem;
+#if CONFIG_STM32_LTDC_L8
+	clut_entry_t clut[STM32_LTDC_CLUT_SIZE];
+#endif
 };
 
 struct display_stm32_ltdc_config {
@@ -104,6 +114,55 @@ static void stm32_ltdc_global_isr(const struct device *dev)
 	}
 }
 
+#if CONFIG_STM32_LTDC_L8
+
+/* Initialize CLUT with selected profile */
+static void stm32_ltdc_clut_init(struct display_stm32_ltdc_data *data)
+{
+#if CONFIG_STM32_LTDC_CLUT_GRAYSCALE
+	/* Linear grayscale: each palette entry i maps to RGB(i, i, i) */
+	for (int i = 0; i < STM32_LTDC_CLUT_SIZE; i++) {
+		uint8_t gray = i & 0xFF;
+		/* CLUT format: ARGB8888 with full opacity */
+		data->clut[i] = 0xFF000000 | (gray << 16) | (gray << 8) | gray;
+	}
+#elif CONFIG_STM32_LTDC_CLUT_CUSTOM
+	/* Initialize to black palette; application will provide custom CLUT */
+	memset(data->clut, 0, sizeof(data->clut));
+#endif
+}
+
+/* Program the CLUT into LTDC hardware */
+static void stm32_ltdc_clut_program(struct display_stm32_ltdc_data *data)
+{
+	LTDC_TypeDef *ltdc_reg = (LTDC_TypeDef *)data->hltdc.Instance;
+
+	/* Write CLUT entries to LTDC peripheral */
+	for (int i = 0; i < STM32_LTDC_CLUT_SIZE; i++) {
+		ltdc_reg->CLUTWR = data->clut[i];
+	}
+}
+
+#if CONFIG_STM32_LTDC_CLUT_UPDATE_API
+/* Public API to update CLUT at runtime */
+int stm32_ltdc_set_clut(const struct device *dev, const clut_entry_t *palette)
+{
+	struct display_stm32_ltdc_data *data = dev->data;
+
+	if (data->current_pixel_format != PIXEL_FORMAT_L_8) {
+		LOG_WRN("CLUT update requested but not in L8 mode");
+		return -ENOTSUP;
+	}
+
+	memcpy(data->clut, palette, sizeof(data->clut));
+	stm32_ltdc_clut_program(data);
+
+	return 0;
+}
+#endif /* CONFIG_STM32_LTDC_CLUT_UPDATE_API */
+
+#endif /* CONFIG_STM32_LTDC_L8 */
+
 static int stm32_ltdc_set_pixel_format(const struct device *dev,
 				const enum display_pixel_format format)
 {
@@ -111,7 +170,9 @@ static int stm32_ltdc_set_pixel_format(const struct device *dev,
 	HAL_StatusTypeDef hal_ret;
 	uint32_t ltdc_pix_fmt;
 
-	if (format == PIXEL_FORMAT_RGB_565) {
+	if (format == PIXEL_FORMAT_L_8) {
+		ltdc_pix_fmt = LTDC_PIXEL_FORMAT_L8;
+	} else if (format == PIXEL_FORMAT_RGB_565) {
 		ltdc_pix_fmt = LTDC_PIXEL_FORMAT_RGB565;
 	} else if (format == PIXEL_FORMAT_RGB_888) {
 		ltdc_pix_fmt = LTDC_PIXEL_FORMAT_RGB888;
@@ -129,6 +190,13 @@ static int stm32_ltdc_set_pixel_format(const struct device *dev,
 	data->current_pixel_format = format;
 	data->current_pixel_size =
 		DISPLAY_BITS_PER_PIXEL(data->current_pixel_format) / BITS_PER_BYTE;
+
+#if CONFIG_STM32_LTDC_L8
+	/* If switching to L8 mode, program the CLUT */
+	if (format == PIXEL_FORMAT_L_8) {
+		stm32_ltdc_clut_program(data);
+	}
+#endif
 
 	return 0;
 }
@@ -158,7 +226,8 @@ static void stm32_ltdc_get_capabilities(const struct device *dev,
 				     data->hltdc.LayerCfg[0].WindowY0;
 	capabilities->supported_pixel_formats = PIXEL_FORMAT_ARGB_8888 |
 					PIXEL_FORMAT_RGB_888 |
-					PIXEL_FORMAT_RGB_565;
+					PIXEL_FORMAT_RGB_565 |
+					PIXEL_FORMAT_L_8;
 	capabilities->screen_info = 0;
 
 	capabilities->current_pixel_format = data->current_pixel_format;
@@ -474,6 +543,11 @@ static int stm32_ltdc_init(const struct device *dev)
 	data->hltdc.LayerCfg[0].FBStartAdress = (uint32_t) data->frame_buffer;
 #endif
 
+#if CONFIG_STM32_LTDC_L8
+	/* Initialize CLUT with selected profile */
+	stm32_ltdc_clut_init(data);
+#endif
+
 	/* Configure layer 1 (only one layer is used) */
 	/* LTDC starts fetching pixels and sending them to display after this call */
 	err = HAL_LTDC_ConfigLayer(&data->hltdc, &data->hltdc.LayerCfg[0], LTDC_LAYER_1);
@@ -486,6 +560,11 @@ static int stm32_ltdc_init(const struct device *dev)
 
 	/* Set the line interrupt position */
 	LTDC->LIPCR = 0U;
+
+#if CONFIG_STM32_LTDC_L8
+	/* Program CLUT into hardware before enabling display */
+	stm32_ltdc_clut_program(data);
+#endif
 
 	return 0;
 }
@@ -586,7 +665,11 @@ static DEVICE_API(display, stm32_ltdc_display_api) = {
 		frame_buffer_##inst[CONFIG_STM32_LTDC_FB_NUM * STM32_LTDC_FRAME_BUFFER_LEN(inst)];
 #endif
 
-/* LTDC supports RGB888 and RGB666 for output however only RGB_888 is supported for now */
+/* LTDC supports RGB888 and RGB666 for panel output; only RGB_888 is supported for now.
+ * Note: This is the output format to the display panel/MIPI-DSI.
+ * The layer input format (framebuffer) can be L8, RGB565, RGB888, or ARGB8888,
+ * independent of the panel output format.
+ */
 #if DT_INST_PROP(0, pixel_format) != PANEL_PIXEL_FORMAT_RGB_888
 #error "Only RGB_888 is supported as a LTDC output (aka panel or mipi-dsi input format)"
 #endif
