@@ -524,6 +524,7 @@ static int i2s_stm32_sai_configure(const struct device *dev, enum i2s_dir dir,
 	SAI_HandleTypeDef *hsai = &dev_data->hsai;
 	uint8_t protocol;
 	uint8_t word_size;
+	uint8_t nbslot;
 
 	memcpy(&stream->i2s_cfg, i2s_cfg, sizeof(struct i2s_config));
 
@@ -655,15 +656,25 @@ static int i2s_stm32_sai_configure(const struct device *dev, enum i2s_dir dir,
 		return -EINVAL;
 	}
 
-	/* MonoStereoMode */
+	/* MonoStereoMode / TDM slot count.
+	 *
+	 * A single active slot uses SAI mono mode; two or more slots use a
+	 * multi-slot (TDM) frame. For PCM protocols the HAL accepts slot counts
+	 * of 1, 2, 4, 8 or 16 and derives the frame length from the data size.
+	 */
 	switch (stream->i2s_cfg.channels) {
 	case 1:
 		hsai->Init.MonoStereoMode = SAI_MONOMODE;
+		nbslot = 1;
 		LOG_DBG("SAI_MONOMODE");
 		break;
 	case 2:
+	case 4:
+	case 8:
+	case 16:
 		hsai->Init.MonoStereoMode = SAI_STEREOMODE;
-		LOG_DBG("SAI_STEREOMODE");
+		nbslot = (uint8_t)stream->i2s_cfg.channels;
+		LOG_DBG("SAI_STEREOMODE, %u slots", nbslot);
 		break;
 	default:
 		LOG_ERR("NOT VALID CHANNEL NUMBER %u", stream->i2s_cfg.channels);
@@ -706,7 +717,7 @@ static int i2s_stm32_sai_configure(const struct device *dev, enum i2s_dir dir,
 	}
 
 	/* Initialize SAI peripheral */
-	if (HAL_SAI_InitProtocol(hsai, protocol, word_size, 2) != HAL_OK) {
+	if (HAL_SAI_InitProtocol(hsai, protocol, word_size, nbslot) != HAL_OK) {
 		LOG_ERR("HAL_SAI_InitProtocol: <FAILED>");
 		return -EIO;
 	}
