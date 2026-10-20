@@ -525,6 +525,8 @@ static int i2s_stm32_sai_configure(const struct device *dev, enum i2s_dir dir,
 	uint8_t protocol;
 	uint8_t word_size;
 	uint8_t nbslot;
+	uint32_t wanted_clock_strobing;
+	uint32_t wanted_fs_polarity;
 
 	memcpy(&stream->i2s_cfg, i2s_cfg, sizeof(struct i2s_config));
 
@@ -688,10 +690,31 @@ static int i2s_stm32_sai_configure(const struct device *dev, enum i2s_dir dir,
 		return -ENOTSUP;
 	}
 
-	if ((stream->i2s_cfg.format & I2S_FMT_DATA_ORDER_LSB) ||
-	    (stream->i2s_cfg.format & I2S_FMT_BIT_CLK_INV) ||
-	    (stream->i2s_cfg.format & I2S_FMT_FRAME_CLK_INV)) {
+	if (stream->i2s_cfg.format & I2S_FMT_DATA_ORDER_LSB) {
 		LOG_ERR("Unsupported stream format");
+		return -EINVAL;
+	}
+
+	switch (stream->i2s_cfg.format & I2S_FMT_CLK_FORMAT_MASK) {
+	case I2S_FMT_CLK_NF_NB:
+		wanted_clock_strobing = SAI_CLOCKSTROBING_RISINGEDGE;
+		wanted_fs_polarity = SAI_FS_ACTIVE_HIGH;
+		break;
+	case I2S_FMT_CLK_NF_IB:
+		wanted_clock_strobing = SAI_CLOCKSTROBING_FALLINGEDGE;
+		wanted_fs_polarity = SAI_FS_ACTIVE_HIGH;
+		break;
+	case I2S_FMT_CLK_IF_NB:
+		wanted_clock_strobing = SAI_CLOCKSTROBING_RISINGEDGE;
+		wanted_fs_polarity = SAI_FS_ACTIVE_LOW;
+		break;
+	case I2S_FMT_CLK_IF_IB:
+		wanted_clock_strobing = SAI_CLOCKSTROBING_FALLINGEDGE;
+		wanted_fs_polarity = SAI_FS_ACTIVE_LOW;
+		break;
+	default:
+		LOG_ERR("Unsupported clock format 0x%x",
+			(unsigned int)(stream->i2s_cfg.format & I2S_FMT_CLK_FORMAT_MASK));
 		return -EINVAL;
 	}
 
@@ -721,6 +744,31 @@ static int i2s_stm32_sai_configure(const struct device *dev, enum i2s_dir dir,
 		LOG_ERR("HAL_SAI_InitProtocol: <FAILED>");
 		return -EIO;
 	}
+
+	/* HAL_SAI_InitProtocol() applies protocol defaults. Override clock and
+	 * frame polarity from Zephyr I2S clock-format flags so codec LRCK/BCK
+	 * settings can be aligned from application Kconfig. */
+	hsai->Init.ClockStrobing = wanted_clock_strobing;
+	hsai->FrameInit.FSPolarity = wanted_fs_polarity;
+	if (HAL_SAI_Init(hsai) != HAL_OK) {
+		LOG_ERR("HAL_SAI_Init (clock format override): <FAILED>");
+		return -EIO;
+	}
+
+	LOG_INF("SAI cfg: protocol=%u word_size=%u slots=%u fs=%uHz master=%u",
+		(unsigned)protocol,
+		(unsigned)stream->i2s_cfg.word_size,
+		(unsigned)nbslot,
+		(unsigned)stream->i2s_cfg.frame_clk_freq,
+		(unsigned)stream->master);
+	LOG_INF("SAI clkfmt: zephyr=0x%x ckstr=%u fspol=%u",
+		(unsigned int)(stream->i2s_cfg.format & I2S_FMT_CLK_FORMAT_MASK),
+		(unsigned int)hsai->Init.ClockStrobing,
+		(unsigned int)hsai->FrameInit.FSPolarity);
+	LOG_INF("SAI regs: CR1=0x%08x FRCR=0x%08x SLOTR=0x%08x",
+		(unsigned int)hsai->Instance->CR1,
+		(unsigned int)hsai->Instance->FRCR,
+		(unsigned int)hsai->Instance->SLOTR);
 
 	stream->state = I2S_STATE_READY;
 

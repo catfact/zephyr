@@ -64,9 +64,17 @@ LOG_MODULE_REGISTER(display_stm32_ltdc, CONFIG_DISPLAY_LOG_LEVEL);
 #define STM32_LTDC_INIT_PIXEL_SIZE	DISPLAY_BITS_PER_PIXEL(DISPLAY_INIT_PIXEL_FORMAT) \
 					/ BITS_PER_BYTE
 
-/* CLUT entry: 8-bit alpha (MSB) + 8-bit red + 8-bit green + 8-bit blue (LSB) */
-#define STM32_LTDC_CLUT_SIZE		256
+#if CONFIG_STM32_LTDC_L8
+#include <zephyr/drivers/display/stm32_ltdc.h>
+
+/* CLUT entry as stored by the driver: 0x00RRGGBB. The hardware CLUTWR register
+ * carries the entry address in bits 31..24, so there is no alpha component.
+ */
+#define STM32_LTDC_CLUT_SIZE		STM32_LTDC_CLUT_ENTRIES
+#define STM32_LTDC_CLUT_RGB_MASK	0x00FFFFFFU
+#define STM32_LTDC_CLUT_TIMEOUT		K_MSEC(100)
 typedef uint32_t clut_entry_t;
+#endif
 
 struct display_stm32_ltdc_data {
 	LTDC_HandleTypeDef hltdc;
@@ -79,6 +87,11 @@ struct display_stm32_ltdc_data {
 	struct k_sem sem;
 #if CONFIG_STM32_LTDC_L8
 	clut_entry_t clut[STM32_LTDC_CLUT_SIZE];
+	/* Set by stm32_ltdc_set_clut(); consumed by the line ISR during vblank. */
+	volatile bool clut_pending;
+	bool clut_initialized;
+	struct k_sem clut_sem;
+	struct k_mutex clut_lock;
 #endif
 };
 
@@ -95,9 +108,45 @@ struct display_stm32_ltdc_config {
 	const struct device *display_controller;
 };
 
+#if CONFIG_STM32_LTDC_L8
+
+/* Initialize CLUT with selected profile */
+static void stm32_ltdc_clut_init(struct display_stm32_ltdc_data *data)
+{
+#if CONFIG_STM32_LTDC_CLUT_GRAYSCALE
+	/* Linear grayscale: each palette entry i maps to RGB(i, i, i) */
+	for (uint32_t i = 0; i < STM32_LTDC_CLUT_SIZE; i++) {
+		data->clut[i] = (i << 16) | (i << 8) | i;
+	}
+#elif CONFIG_STM32_LTDC_CLUT_CUSTOM
+	/* Initialize to black palette; application will provide custom CLUT */
+	memset(data->clut, 0, sizeof(data->clut));
+#endif
+}
+
+/*
+ * Write the cached CLUT into the layer 1 CLUT RAM. The reference manual only
+ * allows CLUTWR writes while the layer is disabled or during blanking, so
+ * callers are init (before the layer is enabled) and the vblank line ISR.
+ * On LTDC versions with per-layer CLUTWR (all supported series) the entry
+ * address goes in bits 31..24.
+ */
+static void stm32_ltdc_clut_program(struct display_stm32_ltdc_data *data)
+{
+	LTDC_Layer_TypeDef *layer = LTDC_LAYER(&data->hltdc, LTDC_LAYER_1);
+
+	for (uint32_t i = 0; i < STM32_LTDC_CLUT_SIZE; i++) {
+		layer->CLUTWR = (i << LTDC_LxCLUTWR_CLUTADD_Pos) |
+				(data->clut[i] & STM32_LTDC_CLUT_RGB_MASK);
+	}
+}
+
+#endif /* CONFIG_STM32_LTDC_L8 */
+
 static void stm32_ltdc_global_isr(const struct device *dev)
 {
 	struct display_stm32_ltdc_data *data = dev->data;
+	bool more_work = false;
 
 	if (__HAL_LTDC_GET_FLAG(&data->hltdc, LTDC_FLAG_LI) &&
 	    __HAL_LTDC_GET_IT_SOURCE(&data->hltdc, LTDC_IT_LI)) {
@@ -110,57 +159,67 @@ static void stm32_ltdc_global_isr(const struct device *dev)
 			k_sem_give(&data->sem);
 		}
 
+#if CONFIG_STM32_LTDC_L8
+		/* Line interrupt position is line 0, i.e. inside vertical blanking. */
+		if (data->clut_pending) {
+			stm32_ltdc_clut_program(data);
+			data->clut_pending = false;
+			k_sem_give(&data->clut_sem);
+		}
+		more_work = data->clut_pending;
+#endif
+
+		more_work = more_work || (data->front_buf != data->pend_buf);
+		if (!more_work) {
+			__HAL_LTDC_DISABLE_IT(&data->hltdc, LTDC_IT_LI);
+		}
+
 		__HAL_LTDC_CLEAR_FLAG(&data->hltdc, LTDC_FLAG_LI);
 	}
 }
 
 #if CONFIG_STM32_LTDC_L8
-
-/* Initialize CLUT with selected profile */
-static void stm32_ltdc_clut_init(struct display_stm32_ltdc_data *data)
-{
-#if CONFIG_STM32_LTDC_CLUT_GRAYSCALE
-	/* Linear grayscale: each palette entry i maps to RGB(i, i, i) */
-	for (int i = 0; i < STM32_LTDC_CLUT_SIZE; i++) {
-		uint8_t gray = i & 0xFF;
-		/* CLUT format: ARGB8888 with full opacity */
-		data->clut[i] = 0xFF000000 | (gray << 16) | (gray << 8) | gray;
-	}
-#elif CONFIG_STM32_LTDC_CLUT_CUSTOM
-	/* Initialize to black palette; application will provide custom CLUT */
-	memset(data->clut, 0, sizeof(data->clut));
-#endif
-}
-
-/* Program the CLUT into LTDC hardware */
-static void stm32_ltdc_clut_program(struct display_stm32_ltdc_data *data)
-{
-	LTDC_TypeDef *ltdc_reg = (LTDC_TypeDef *)data->hltdc.Instance;
-
-	/* Write CLUT entries to LTDC peripheral */
-	for (int i = 0; i < STM32_LTDC_CLUT_SIZE; i++) {
-		ltdc_reg->CLUTWR = data->clut[i];
-	}
-}
-
-#if CONFIG_STM32_LTDC_CLUT_UPDATE_API
-/* Public API to update CLUT at runtime */
-int stm32_ltdc_set_clut(const struct device *dev, const clut_entry_t *palette)
+int stm32_ltdc_set_clut(const struct device *dev, const uint32_t *entries,
+			size_t first, size_t count)
 {
 	struct display_stm32_ltdc_data *data = dev->data;
+	unsigned int key;
+	int ret = 0;
 
-	if (data->current_pixel_format != PIXEL_FORMAT_L_8) {
-		LOG_WRN("CLUT update requested but not in L8 mode");
-		return -ENOTSUP;
+	if ((entries == NULL) || (count == 0U) || (first >= STM32_LTDC_CLUT_SIZE) ||
+	    (count > (STM32_LTDC_CLUT_SIZE - first))) {
+		return -EINVAL;
 	}
 
-	memcpy(data->clut, palette, sizeof(data->clut));
-	stm32_ltdc_clut_program(data);
+	k_mutex_lock(&data->clut_lock, K_FOREVER);
 
-	return 0;
+	/* The ISR only reads data->clut while clut_pending is set. */
+	key = irq_lock();
+	data->clut_pending = false;
+	irq_unlock(key);
+
+	for (size_t i = 0; i < count; i++) {
+		data->clut[first + i] = entries[i] & STM32_LTDC_CLUT_RGB_MASK;
+	}
+
+	k_sem_reset(&data->clut_sem);
+	key = irq_lock();
+	data->clut_pending = true;
+	__HAL_LTDC_ENABLE_IT(&data->hltdc, LTDC_IT_LI);
+	irq_unlock(key);
+
+	if (k_sem_take(&data->clut_sem, STM32_LTDC_CLUT_TIMEOUT) != 0) {
+		key = irq_lock();
+		data->clut_pending = false;
+		irq_unlock(key);
+		LOG_WRN("CLUT update timed out (LTDC not scanning?)");
+		ret = -ETIMEDOUT;
+	}
+
+	k_mutex_unlock(&data->clut_lock);
+
+	return ret;
 }
-#endif /* CONFIG_STM32_LTDC_CLUT_UPDATE_API */
-
 #endif /* CONFIG_STM32_LTDC_L8 */
 
 static int stm32_ltdc_set_pixel_format(const struct device *dev,
@@ -191,12 +250,7 @@ static int stm32_ltdc_set_pixel_format(const struct device *dev,
 	data->current_pixel_size =
 		DISPLAY_BITS_PER_PIXEL(data->current_pixel_format) / BITS_PER_BYTE;
 
-#if CONFIG_STM32_LTDC_L8
-	/* If switching to L8 mode, program the CLUT */
-	if (format == PIXEL_FORMAT_L_8) {
-		stm32_ltdc_clut_program(data);
-	}
-#endif
+	/* CLUT RAM is loaded and CLUTEN set at init; it only affects L8 fetches. */
 
 	return 0;
 }
@@ -274,9 +328,8 @@ static void stm32_ltdc_sync_frame(struct display_stm32_ltdc_data *data, const ui
 	__HAL_LTDC_CLEAR_FLAG(&data->hltdc, LTDC_FLAG_LI);
 	__HAL_LTDC_ENABLE_IT(&data->hltdc, LTDC_IT_LI);
 
+	/* The ISR disables the line interrupt once no swap or CLUT load is pending. */
 	k_sem_take(&data->sem, K_FOREVER);
-
-	__HAL_LTDC_DISABLE_IT(&data->hltdc, LTDC_IT_LI);
 }
 
 static int stm32_ltdc_write(const struct device *dev, const uint16_t x,
@@ -511,6 +564,17 @@ static int stm32_ltdc_init(const struct device *dev)
 
 	k_sem_init(&data->sem, 0, 1);
 
+#if CONFIG_STM32_LTDC_L8
+	k_sem_init(&data->clut_sem, 0, 1);
+	k_mutex_init(&data->clut_lock);
+	data->clut_pending = false;
+	/* Keep the application's palette across PM suspend/resume re-inits. */
+	if (!data->clut_initialized) {
+		stm32_ltdc_clut_init(data);
+		data->clut_initialized = true;
+	}
+#endif
+
 	config->irq_config_func(dev);
 
 #ifdef CONFIG_STM32_LTDC_DISABLE_FMC_BANK1
@@ -544,8 +608,13 @@ static int stm32_ltdc_init(const struct device *dev)
 #endif
 
 #if CONFIG_STM32_LTDC_L8
-	/* Initialize CLUT with selected profile */
-	stm32_ltdc_clut_init(data);
+	/*
+	 * Layer 1 is still disabled here, which is when CLUTWR writes are allowed.
+	 * CLUTEN lives in the shadowed LxCR; HAL_LTDC_ConfigLayer() preserves it
+	 * and its immediate reload makes it active together with the layer.
+	 */
+	stm32_ltdc_clut_program(data);
+	LTDC_LAYER(&data->hltdc, LTDC_LAYER_1)->CR |= LTDC_LxCR_CLUTEN;
 #endif
 
 	/* Configure layer 1 (only one layer is used) */
@@ -558,13 +627,8 @@ static int stm32_ltdc_init(const struct device *dev)
 	/* Disable layer 2, since it not used */
 	__HAL_LTDC_LAYER_DISABLE(&data->hltdc, LTDC_LAYER_2);
 
-	/* Set the line interrupt position */
+	/* Set the line interrupt position (line 0 is within vertical blanking) */
 	LTDC->LIPCR = 0U;
-
-#if CONFIG_STM32_LTDC_L8
-	/* Program CLUT into hardware before enabling display */
-	stm32_ltdc_clut_program(data);
-#endif
 
 	return 0;
 }

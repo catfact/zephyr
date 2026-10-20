@@ -91,7 +91,8 @@ choice STM32_LTDC_CLUT_PROFILE
 	default STM32_LTDC_CLUT_GRAYSCALE
 	help
 	  Select the default CLUT configuration for indexed color mode.
-	  This sets the initial color palette; runtime updates are possible via API.
+	  This sets the initial color palette; runtime updates are possible via
+	  stm32_ltdc_set_clut() (<zephyr/drivers/display/stm32_ltdc.h>).
 
 config STM32_LTDC_CLUT_GRAYSCALE
 	bool "Grayscale"
@@ -104,13 +105,5 @@ config STM32_LTDC_CLUT_CUSTOM
 	  Empty black palette; application must upload custom CLUT before rendering
 
 endchoice
-
-config STM32_LTDC_CLUT_UPDATE_API
-	bool "Enable CLUT runtime update API"
-	depends on STM32_LTDC_L8
-	default y
-	help
-	  Expose a function to update the color palette at runtime.
-	  Required for palette animation or dynamic theme switching.
 
 endif # STM32_LTDC
