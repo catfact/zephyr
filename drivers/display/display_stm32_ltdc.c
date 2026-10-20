@@ -250,7 +250,12 @@ static int stm32_ltdc_set_pixel_format(const struct device *dev,
 	data->current_pixel_size =
 		DISPLAY_BITS_PER_PIXEL(data->current_pixel_format) / BITS_PER_BYTE;
 
-	/* CLUT RAM is loaded and CLUTEN set at init; it only affects L8 fetches. */
+#if CONFIG_STM32_LTDC_L8
+	/* CLUT RAM is loaded at init; keep CLUTEN set across the HAL's LxCR rewrite. */
+	if (HAL_LTDC_EnableCLUT(&data->hltdc, LTDC_LAYER_1) != HAL_OK) {
+		return -EIO;
+	}
+#endif
 
 	return 0;
 }
@@ -608,13 +613,8 @@ static int stm32_ltdc_init(const struct device *dev)
 #endif
 
 #if CONFIG_STM32_LTDC_L8
-	/*
-	 * Layer 1 is still disabled here, which is when CLUTWR writes are allowed.
-	 * CLUTEN lives in the shadowed LxCR; HAL_LTDC_ConfigLayer() preserves it
-	 * and its immediate reload makes it active together with the layer.
-	 */
+	/* Layer 1 is still disabled here, which is when CLUTWR writes are allowed. */
 	stm32_ltdc_clut_program(data);
-	LTDC_LAYER(&data->hltdc, LTDC_LAYER_1)->CR |= LTDC_LxCR_CLUTEN;
 #endif
 
 	/* Configure layer 1 (only one layer is used) */
@@ -623,6 +623,18 @@ static int stm32_ltdc_init(const struct device *dev)
 	if (err != HAL_OK) {
 		return err;
 	}
+
+#if CONFIG_STM32_LTDC_L8
+	/*
+	 * Enable the CLUT only after the layer is configured: on N6, LxCR reads
+	 * return the active (not pending shadow) value, so the HAL's
+	 * read-modify-write that sets LEN drops a CLUTEN written beforehand.
+	 */
+	err = HAL_LTDC_EnableCLUT(&data->hltdc, LTDC_LAYER_1);
+	if (err != HAL_OK) {
+		return err;
+	}
+#endif
 
 	/* Disable layer 2, since it not used */
 	__HAL_LTDC_LAYER_DISABLE(&data->hltdc, LTDC_LAYER_2);
